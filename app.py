@@ -24,7 +24,7 @@ except Exception as e:
 st.set_page_config(layout="wide", page_title="ZeroDeadline", page_icon="🚨")
 
 # 실제 API Key를 입력하세요. 
-API_KEY = "AIzaSyCLA6mWtjJ4D5rQR_IrdmaYjJUfHiEI1fY" 
+API_KEY = "your key" 
 RISK_HISTORY_FILE = "data/risk_history.json"
 
 if not API_KEY or not API_KEY.startswith("AIza"):
