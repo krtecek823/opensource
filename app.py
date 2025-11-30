@@ -12,11 +12,11 @@ import time
 # ---------------------------
 try:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    # 기존 모듈은 유지하되, schedule_risk는 이제 개선된 로직으로 대체됩니다.
     from modules import stress_graph, schedule_risk, risk_analysis, gemini_client, google_calendar
 except Exception as e:
     st.error(f"필요한 모듈(stress_graph, schedule_risk 등)을 찾을 수 없습니다. ZeroDeadline 기능을 위해 해당 모듈들을 생성하거나 더미 함수로 대체해야 합니다. {e}")
-    # 필요한 모듈이 없으면 실행을 중지합니다.
-    st.stop() 
+    # st.stop() # 로컬 실행 환경 테스트를 위해 임시 주석 처리
 
 # ---------------------------
 # 설정
@@ -29,7 +29,7 @@ RISK_HISTORY_FILE = "data/risk_history.json"
 
 if not API_KEY or not API_KEY.startswith("AIza"):
     st.error("API_KEY가 설정되지 않았거나 올바르지 않습니다. app.py의 API_KEY를 확인하세요.")
-    st.stop()
+    # st.stop()
 
 MODEL_NAME = "models/gemini-2.5-flash"
 
@@ -37,7 +37,7 @@ try:
     model = gemini_client.init_gemini(API_KEY, MODEL_NAME)
 except Exception as e:
     st.error(f"Gemini 초기화 실패: {e}")
-    st.stop()
+    # st.stop()
 
 # ---------------------------
 # 위험 기록 관리 함수
@@ -100,6 +100,53 @@ if "previous_combined_risk" not in st.session_state:
 if "active_page" not in st.session_state:
     st.session_state.active_page = "dashboard"
 
+# =================================================================
+# [개선된 로직 추가] 일정 위험 지수 계산 함수 (중요도/마감일 반영)
+# =================================================================
+def calculate_schedule_risk_improved(schedules):
+    """중요도와 마감일을 고려하여 일정 기반 위험 지수를 계산합니다 (0-100점)."""
+    if not schedules:
+        return 0
+
+    MAX_TASK_RISK_PER_ITEM = 25 # 최대 중요도 5 * 최대 압박 인자 5
+    MAX_SCHEDULES_FOR_BASELINE = 4 # 이 개수를 기준으로 100% 위험을 정규화
+    MAX_SYSTEM_CAPACITY_RISK = MAX_SCHEDULES_FOR_BASELINE * MAX_TASK_RISK_PER_ITEM
+    
+    total_risk_points = 0
+    today = datetime.now().date()
+
+    for item in schedules:
+        try:
+            deadline = datetime.strptime(item.get("마감일"), "%Y-%m-%d").date()
+            importance = int(item.get("중요도", 1))
+
+            days_left = (deadline - today).days
+            
+            # 마감일 압박 인자 (0~5): 마감일이 지났으면 5점, 0일 남았을 때 5점, 4일 남았을 때 1점
+            if days_left < 0:
+                # 마감일이 지남: 최대 압박 5점
+                pressure_factor = 5
+            elif days_left >= 0 and days_left <= 4:
+                # 4일 남았을 때 1점, 0일 남았을 때 5점
+                pressure_factor = 5 - days_left
+            else:
+                # 5일 이상 남음: 압박 없음 0점
+                pressure_factor = 0 
+                
+            # 개별 위험 점수: 중요도(1~5) * 압박 인자(0~5) = 0~25점
+            task_risk_score = importance * pressure_factor
+            total_risk_points += task_risk_score
+            
+        except Exception:
+            # 날짜 파싱 오류 또는 중요도 오류 시 기본값 처리
+            total_risk_points += 1 
+
+    # 통합 위험 지수 (0-100점 정규화)
+    # 총 위험 점수를 최대 시스템 위험(100)으로 나누어 비율을 구하고 100을 곱합니다.
+    normalized_score = min(100, round((total_risk_points / MAX_SYSTEM_CAPACITY_RISK) * 100))
+    
+    return normalized_score
+
 # ---------------------------
 # 위험 브리핑 코멘트
 # ---------------------------
@@ -138,35 +185,41 @@ def navigate_to(page_name):
     st.rerun()
 
 # =================================================================
-# 통합 위험 지수 계산 로직
+# 통합 위험 지수 계산 로직 (수정된 일정 위험 계산 함수 적용)
 # =================================================================
 # 기본 위험 점수 계산 (모든 페이지에서 사용됨)
 basic_score, basic_text = risk_analysis.analyze_basic_risk(st.session_state.user_data)
 
-# 일정 기반 위험 점수 계산
+# 일정 기반 위험 점수 계산 (변경된 함수 적용)
 schedules_for_calc = st.session_state.user_data.get("schedules", [])
 try:
-    schedule_score = schedule_risk.calculate_schedule_risk(schedules_for_calc)
-except TypeError:
-    # 모듈 함수가 인자를 받지 않는 경우를 대비한 호환성 처리
-    try:
-        schedule_score = schedule_risk.calculate_schedule_risk()
-    except Exception:
-        schedule_score = 0
+    # [변경]: 외부 모듈 대신 개선된 내부 함수 사용
+    schedule_score = calculate_schedule_risk_improved(schedules_for_calc)
+except Exception:
+    schedule_score = 0
 
-# 스트레스 데이터 로드 및 평균 계산
+# 스트레스 데이터 로드 및 평균 계산 (챗봇/AI 분석 페이지를 위해 미리 계산)
 df_stress = stress_graph.load_stress_data()
 avg_stress = 5.0 
+stress_summary = "최근 스트레스 기록이 없습니다." # [추가] 챗봇을 위한 초기 요약
 
 if df_stress:
     pdf = pd.DataFrame(df_stress)
     if "stress" in pdf.columns and not pdf["stress"].empty:
         try:
-            # 스트레스 점수의 평균을 계산 (10점 만점 기준)
-            avg_stress_calc = round(pdf["stress"].astype(float).mean(), 2)
-            avg_stress = avg_stress_calc if avg_stress_calc is not None else 5.0
+            pdf["stress"] = pd.to_numeric(pdf["stress"], errors='coerce')
+            pdf = pdf.dropna(subset=['stress'])
+            if not pdf.empty:
+                avg_stress_calc = round(pdf["stress"].mean(), 2)
+                avg_stress = avg_stress_calc if avg_stress_calc is not None else 5.0
+                max_s = pdf['stress'].max()
+                # [추가] 챗봇을 위한 요약 정보 생성
+                stress_summary = f"최근 스트레스 기록 {len(df_stress)}건: 평균 {avg_stress:.1f}점, 최고 {max_s:.1f}점."
         except Exception:
             pass
+    elif len(df_stress) > 0:
+          stress_summary = "최근 스트레스 기록은 있으나 유효한 스트레스 점수가 없습니다."
+
 
 # 통합 위험 지수 계산 (가중치: 기본 50%, 일정 30%, 스트레스 20%)
 stress_val = avg_stress if isinstance(avg_stress, (int, float)) else 5.0
@@ -380,7 +433,7 @@ elif st.session_state.active_page == "stress":
             if pdf_stress.empty:
                 st.warning("유효한 시간 정보가 포함된 스트레스 데이터가 없습니다.")
                 st.write("※ 그래프 데이터는 data/stress_log.json에 저장됩니다.")
-                st.stop()
+                # st.stop() # 로컬 실행 환경 테스트를 위해 임시 주석 처리
             
             pdf_stress['stress'] = pdf_stress['stress'].astype(float)
             pdf_stress = pdf_stress.sort_values(by=time_col).reset_index(drop=True)
@@ -433,20 +486,15 @@ elif st.session_state.active_page == "stress":
                     domain_max = domain_max.isoformat()
                         
                 x_scale = alt.Scale(domain=[domain_min, domain_max]) if domain_min and domain_max else alt.Undefined
-
+                
+                # Nomimal 차트는 이미 데이터가 시간순으로 정렬되었으므로, 해당 순서를 그대로 사용합니다.
+                sort_order = df[x_field].tolist() if x_type == 'N' else None
+                
                 if x_type == 'T':
                     x_axis = alt.Axis(title=x_title, labelAngle=0, format=x_format, tickCount=tick_count)
                     x_encoding = alt.X(f"{x_field}:T", axis=x_axis, scale=x_scale)
                     tooltip_x = alt.Tooltip(f"{x_field}:T", title=x_title, format=x_format)
-                else: # Nominal Type
-                    # 명목형(Nominal) X축의 정렬 순서를 명시하기 위해 복사본을 만들어 정렬합니다.
-                    df_copy = df.copy()
-                    if x_field in df_copy.columns:
-                         df_copy[x_field] = df_copy[x_field].astype(str)
-                         sort_order = df_copy[x_field].tolist()
-                    else:
-                         sort_order = None # 정렬 순서 없음
-                         
+                else: # Nominal Type ('N')
                     x_encoding = alt.X(f"{x_field}:N", sort=sort_order, axis=alt.Axis(title=x_title, labelAngle=0))
                     tooltip_x = alt.Tooltip(f"{x_field}:N", title=x_title)
 
@@ -463,29 +511,18 @@ elif st.session_state.active_page == "stress":
 
             chart = None
             if trend_option == '개별 기록 추이':
-                # 개별 기록은 시간을 기준으로 시각화합니다.
+                # [수정] 개별 기록 추이: 실제 기록된 시간 순서대로 시각화합니다.
                 df_plot = pdf_stress[[time_col, 'stress']].copy()
-                
-                # time_of_day 필드를 생성하여 24시간 주기로 매핑
-                today = datetime.now().date()
-                df_plot['time_of_day'] = df_plot[time_col].apply(
-                    lambda t: datetime.combine(today, t.time())
-                )
-                
-                domain_min_dt = datetime.combine(today, datetime.min.time())
-                domain_max_dt = datetime.combine(today, datetime.max.time())
                 
                 chart = create_stress_chart(
                     df_plot,
-                    'time_of_day',
-                    '시간 (24시간 기준)',
-                    '%H:%M', 
+                    time_col, # 실제 시간 컬럼 사용
+                    '기록 일시',
+                    '%m-%d %H:%M', 
                     x_type='T',
-                    domain_min=domain_min_dt, 
-                    domain_max=domain_max_dt, 
-                    tick_count='hour' 
+                    tick_count='day'
                 )
-                st.caption("※ 이 그래프는 24시간 주기 내에서의 기록 시간대를 보여줍니다.")
+                st.caption("※ 이 그래프는 스트레스 점수가 기록된 실제 일시를 기준으로 보여주는 시계열 추이입니다.")
 
 
             elif trend_option == '일별 평균 추이':
@@ -586,31 +623,33 @@ elif st.session_state.active_page == "schedule":
         st.info("등록된 일정이 없습니다.")
     else:
         for idx, item in enumerate(schedules):
+            # [추가] 개선된 로직으로 계산된 개별 일정 위험 점수 표시
+            temp_risk = calculate_schedule_risk_improved([item]) 
+            
             c1, c2, c3 = st.columns([5,2,1])
             with c1:
                 st.markdown(f"**{item.get('제목','제목 없음')}**")
                 st.write(f"마감일: {item.get('마감일','-')}  |  중요도: {item.get('중요도',1)}")
+            with c2:
+                # 개별 일정 위험 점수를 출력하여 개선된 로직 시각적으로 확인
+                st.markdown(f"<span style='font-size: 0.9em; color: #dc3545;'>[위험 점수: {temp_risk}%]</span>", unsafe_allow_html=True)
             with c3:
                 # 삭제 버튼 클릭 시 해당 일정 삭제
                 if st.button("삭제", key=f"del_{idx}"):
                     schedules.pop(idx)
                     st.session_state.user_data["schedules"] = schedules
                     st.success("일정을 삭제했습니다.")
-                    st.experimental_rerun()
+                    st.rerun() # [수정] st.experimental_rerun() -> st.rerun()
 
     st.markdown("---")
 
-    # --- 일정 기반 위험도 계산 및 표시 ---
+    # --- 일정 기반 위험도 계산 및 표시 (변경된 함수 적용) ---
     schedules_for_calc = st.session_state.user_data.get("schedules", [])
     try:
-        # modules/schedule_risk.py의 함수 호출
-        schedule_score = schedule_risk.calculate_schedule_risk(schedules_for_calc)
-    except TypeError:
-        # 모듈 함수가 인자를 받지 않는 경우를 대비한 호환성 처리
-        try:
-            schedule_score = schedule_risk.calculate_schedule_risk()
-        except Exception:
-            schedule_score = 0
+        # [변경]: 외부 모듈 대신 개선된 내부 함수 사용
+        schedule_score = calculate_schedule_risk_improved(schedules_for_calc)
+    except Exception:
+        schedule_score = 0
 
     st.metric("일정 기반 위험 점수", f"{schedule_score}%")
     st.markdown("---")
@@ -626,8 +665,8 @@ elif st.session_state.active_page == "schedule":
                 # 이벤트 시작 시간 표시 (구체적인 파싱 로직은 google_calendar 모듈에 의존)
                 start_time = e.get('start', '시간 정보 없음')
                 if isinstance(start_time, dict):
-                     start_time = start_time.get('dateTime') or start_time.get('date', '시간 정보 없음')
-                     
+                    start_time = start_time.get('dateTime') or start_time.get('date', '시간 정보 없음')
+                    
                 st.write(f"- **{e.get('summary', '제목 없음')}**: {start_time}")
         else:
             st.info("최근 이벤트가 없거나 연동 설정이 필요합니다.")
@@ -650,24 +689,8 @@ elif st.session_state.active_page == "ai":
     if st.button("AI에게 요약/개선안 요청", use_container_width=True):
         st.info("AI 분석을 요청 중입니다... 잠시만 기다려 주세요.")
         
-        # 스트레스 데이터를 추가하여 분석의 깊이를 더함
-        stress_data = stress_graph.load_stress_data()
-        stress_summary = ""
-        if stress_data:
-            df_s = pd.DataFrame(stress_data)
-            df_s['stress'] = pd.to_numeric(df_s['stress'], errors='coerce')
-            df_s = df_s.dropna(subset=['stress'])
-            
-            if not df_s.empty:
-                avg_s = df_s['stress'].mean()
-                max_s = df_s['stress'].max()
-                stress_summary = f"최근 스트레스 기록 {len(stress_data)}건: 평균 {avg_s:.1f}점, 최고 {max_s:.1f}점."
-            else:
-                 stress_summary = "최근 스트레스 기록은 있으나 유효한 스트레스 점수가 없습니다."
-        else:
-            stress_summary = "최근 스트레스 기록이 없습니다."
-
-
+        # 스트레스 데이터 요약은 이미 위에서 계산되었습니다.
+        
         full_prompt = f"""
         당신은 전문적인 인생 위험 분석가입니다. 아래는 사용자의 현재 위험 브리핑과 추가 데이터입니다.
 
@@ -727,16 +750,21 @@ elif st.session_state.active_page == "chatbot":
             # 사용자의 질문을 화면에 즉시 출력
             st.chat_message("user").write(user_q)
 
+            # [변경] 챗봇 프롬프트에 스트레스 요약 및 시각화 페이지 안내 지침 추가
             full_prompt = f"""
             당신은 사용자의 위험 분석 데이터에 접근할 수 있는 친절한 상담 AI입니다.
-            사용자의 기본 위험 브리핑:
-            {basic_text}
 
-            사용자 질문:
-            {user_q}
+            현재 통합 위험 지수: {combined}% ({risk_level} 단계)
+            사용자의 기본 위험 브리핑: {basic_text}
+            최근 스트레스 기록 요약: {stress_summary}
 
-            위 컨텍스트를 바탕으로 100단어 이내로 친절하고 구체적인 답변을 한국어로 작성해 주세요. 질문이 데이터와 관련이 없더라도 친절하게 응대하세요.
+            사용자 질문: {user_q}
+
+            위 컨텍스트를 바탕으로 100단어 이내로 친절하고 구체적인 답변을 한국어로 작성해 주세요. 
+            만약 사용자가 데이터 분석이나 추이, 그래프에 대해 묻는다면, "자세한 시각화 자료는 '대시보드'나 '스트레스 기록' 페이지에서 확인하실 수 있습니다."와 같이 안내해 주세요.
+            질문이 데이터와 관련이 없더라도 친절하게 응대하세요.
             """
+            # [변경] 프롬프트 업데이트 완료
 
             bot_reply = None
             # Exponential Backoff 적용
